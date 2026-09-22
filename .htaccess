@@ -1,0 +1,3 @@
+# Serve mcp.php for the directory URL, so clients can point at
+# https://host/bhl-mcp/ rather than https://host/bhl-mcp/mcp.php
+DirectoryIndex mcp.php
