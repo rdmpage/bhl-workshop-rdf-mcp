@@ -1374,8 +1374,28 @@ function sendJson($payload, $status = 200)
 
 function infoPage()
 {
-    $url = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http')
-         . '://' . (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost')
+    // Behind a TLS-terminating proxy (Caddy, nginx, a load balancer) the request
+    // reaches PHP as plain HTTP, so $_SERVER['HTTPS'] is unset and we would print
+    // an http:// URL that no remote MCP client will accept. Trust the forwarded
+    // header, which is what the proxy sets.
+    $proto = 'http';
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        $proto = 'https';
+    } elseif (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+        $proto = strtolower(trim(explode(',', $_SERVER['HTTP_X_FORWARDED_PROTO'])[0]));
+    } elseif (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on') {
+        $proto = 'https';
+    }
+    $proto = ($proto === 'https') ? 'https' : 'http';
+
+    $host = 'localhost';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+        $host = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_HOST'])[0]);
+    } elseif (!empty($_SERVER['HTTP_HOST'])) {
+        $host = $_SERVER['HTTP_HOST'];
+    }
+
+    $url = $proto . '://' . $host
          . (isset($_SERVER['REQUEST_URI']) ? strtok($_SERVER['REQUEST_URI'], '?') : '/');
 
     $tools = '';
