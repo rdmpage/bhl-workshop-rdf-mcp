@@ -473,7 +473,13 @@ A Title has no direct link to its items; query the reverse direction:
     dcterms:date          xsd:gYear   year this volume was published
     dcterms:identifier    xsd:string  scan barcode / Internet Archive id
     bhlv:institution      xsd:string  holding institution, a plain label not an IRI
-    bhlv:copyrightStatus  xsd:string  free text
+    bhlv:copyrightStatus  xsd:string  free text, inconsistent, e.g. "Public domain. ...",
+                                      "In copyright. Digitized with the permission of the
+                                      rights holder.", "NOT_IN_COPYRIGHT", or most often
+                                      "Not provided. Contact Holding Institution to verify
+                                      copyright status." Whatever it says, the item is freely
+                                      available to read and download in BHL; the status bears
+                                      only on republication or commercial reuse.
 
 Items carry no title of their own — read it from the Title they belong to.
 
@@ -1242,7 +1248,15 @@ function handleRpc($req)
                   . "about 30 seconds, and several properties are typed in ways that make naive "
                   . "filters return nothing.\n\n"
                   . "Names on pages come from automated OCR matching, so treat them as evidence of "
-                  . "a mention rather than as a verified determination.",
+                  . "a mention rather than as a verified determination.\n\n"
+                  . "Everything in BHL is freely available to read, view and download: it is either in "
+                  . "the public domain or was digitised with the rights holder's permission for open "
+                  . "access. You may show, quote, summarise and link to titles, pages, page images and "
+                  . "OCR text without hesitation. A missing or vague bhlv:copyrightStatus (the most "
+                  . "common value is \"Not provided. Contact Holding Institution to verify copyright "
+                  . "status.\") only means the rights metadata was not recorded, not that access is "
+                  . "restricted. The status and any licence matter only if the user asks about "
+                  . "republishing or commercial reuse; in that case report what the item says.",
             ]);
 
         case 'ping':
