@@ -46,6 +46,19 @@ define('BHL_MAX_LITERAL', 400);   // truncate long literals in rendered tables
 define('BHL_SERVER_NAME', 'bhl-rdf');
 define('BHL_SERVER_VERSION', '1.0.0');
 
+/**
+ * BHL's open data on AWS: every page's OCR text, and its image both as a
+ * JPEG 2000 master and as WebP at several sizes, public and unauthenticated.
+ * Page text and images come from here rather than biodiversitylibrary.org,
+ * whose Cloudflare bot filter turns away a good share of automated requests.
+ */
+define('BHL_S3_BASE', getenv('BHL_S3_BASE') ?: 'https://bhl-open-data.s3.amazonaws.com/');
+// WebP sizes on AWS, with the long edge of a typical page (they scale with the scan).
+define('BHL_IMAGE_SIZES', ['thumb' => 235, 'small' => 370, 'medium' => 730, 'large' => 1460, 'full' => 3800]);
+define('BHL_IMAGE_SIZE', 'large');
+define('BHL_TEXT_PAGES', 20);        // default pages of OCR per get_text call
+define('BHL_MAX_TEXT_PAGES', 50);
+
 $SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 $DEFAULT_PROTOCOL = '2025-06-18';
 
@@ -1045,6 +1058,200 @@ function toolRegistry()
         },
     ],
 
+    'get_page' => [
+        'title' => 'Show a page: image and text',
+        'description' =>
+            "Fetch one scanned page: its OCR text and an image of the page, which is returned "
+          . "in the result so you can look at it (plates, figures, tables, handwriting, or to "
+          . "check the OCR). Also gives direct image URLs that you can show the user, e.g. as "
+          . "a Markdown image or in HTML. Text and images come from BHL's open data "
+          . "on AWS, so use this rather than fetching biodiversitylibrary.org pages, which "
+          . "often block automated requests. Takes a page IRI, 'page/2839616' or a bare page id.",
+        'schema' => [
+            'type' => 'object',
+            'properties' => [
+                'page'       => ['type' => 'string', 'description' => "Page IRI, 'page/2839616' or '2839616'."],
+                'image'      => ['type' => 'boolean', 'description' => 'Include the page image (default true).'],
+                'text'       => ['type' => 'boolean', 'description' => 'Include the OCR text (default true).'],
+                'image_size' => ['type' => 'string', 'enum' => array_keys(BHL_IMAGE_SIZES),
+                                 'description' => "Image size (default '" . BHL_IMAGE_SIZE . "', about 1460px "
+                                  . "on the long side). 'full' is the original scan, for reading small print."],
+            ],
+            'required' => ['page'],
+        ],
+        'handler' => function ($args) {
+            $pageIri = bhlIri(requireArg($args, 'page'), 'page');
+            if (!preg_match('#/page/(\d+)$#', $pageIri, $m)) {
+                throw new BhlError("get_page takes a page, such as 'page/2839616'. For an article "
+                    . "or a run of pages in an item, use get_text.");
+            }
+            $pageId = (int)$m[1];
+            $wantImage = !isset($args['image']) || $args['image'];
+            $wantText  = !isset($args['text'])  || $args['text'];
+            $size = isset($args['image_size']) ? strtolower(trim($args['image_size'])) : BHL_IMAGE_SIZE;
+            if (!isset(BHL_IMAGE_SIZES[$size])) {
+                throw new BhlError("image_size must be one of: " . implode(', ', array_keys(BHL_IMAGE_SIZES)) . '.');
+            }
+
+            $recs = pageRecords("  VALUES ?page { " . sparqlIri($pageIri) . " }\n", 1);
+            if (!$recs) {
+                throw new BhlError("Page $pageId is not in the graph. If it belongs to an article, "
+                    . "get_text on the article may still find its text.");
+            }
+            $rec = $recs[0];
+            $ctx = pageContext($rec);
+
+            $out = '# ' . pageLabel($rec) . ' — bhlpage:' . $pageId . "\n";
+            $out .= 'Sequence ' . ($rec['seq'] !== null ? $rec['seq'] : '?') . ' in bhlitem:' . $rec['item'];
+            if ($ctx['title'] !== null) {
+                $out .= ', ' . $ctx['title'] . ($ctx['year'] !== null ? ' (' . $ctx['year'] . ')' : '');
+            }
+            $out .= "\n";
+            foreach ($ctx['parts'] as $partId => $partTitle) {
+                $out .= "In article bhlpart:$partId" . ($partTitle !== null ? " \"$partTitle\"" : '') . "\n";
+            }
+
+            $out .= "\nLinks\n";
+            $out .= '- BHL page: ' . BHL_BASE . "page/$pageId\n";
+            if (imageUrl($rec, $size) !== null) {
+                $out .= "- Page image (WebP), to show the user; change '_$size' for another size ("
+                      . implode(', ', array_keys(BHL_IMAGE_SIZES)) . "): " . imageUrl($rec, $size) . "\n";
+            }
+
+            $content = [];
+            $note = '';
+            if ($wantImage) {
+                try {
+                    $content[] = [
+                        'type'     => 'image',
+                        'data'     => base64_encode(pageImage($rec, $size)),
+                        'mimeType' => 'image/webp',
+                    ];
+                } catch (BhlError $e) {
+                    $note = "\nImage not included: " . $e->getMessage() . "\n";
+                }
+            }
+
+            if ($wantText) {
+                $texts = fetchPageTexts([$rec], array_keys($ctx['parts']));
+                $t = $texts[$pageId];
+                if ($t['url'] !== null) {
+                    $out .= '- OCR text: ' . $t['url'] . "\n";
+                }
+                $out .= $note;
+                $out .= "\n## OCR text\n\n" . ($t['text'] !== null && $t['text'] !== ''
+                    ? $t['text'] : '(no OCR text for this page)') . "\n";
+            } else {
+                $out .= $note;
+            }
+
+            array_unshift($content, ['type' => 'text', 'text' => $out]);
+            return ['content' => $content];
+        },
+    ],
+
+    'get_text' => [
+        'title' => 'Read the text of pages',
+        'description' =>
+            "Fetch the OCR text of an article (all its pages, in order), of a run of pages in a "
+          . "scanned item, or of a single page. Use this to read, quote or summarise what a work "
+          . "actually says. For an item, pick pages by sequence number with from and to "
+          . "(default the first " . BHL_TEXT_PAGES . "); get_record on a page gives its sequence "
+          . "number. Text is raw OCR, so expect errors, especially in old typefaces and tables; "
+          . "use get_page to see the image when it matters. Returns at most "
+          . BHL_MAX_TEXT_PAGES . " pages per call.",
+        'schema' => [
+            'type' => 'object',
+            'properties' => [
+                'id'        => ['type' => 'string', 'description' => "An article ('part/248'), item ('item/21356') or page ('page/2839616'), or a full IRI."],
+                'from'      => ['type' => 'integer', 'description' => 'Items only: first page, by sequence number within the item (default 1).'],
+                'to'        => ['type' => 'integer', 'description' => 'Items only: last page, by sequence number (inclusive).'],
+                'max_pages' => ['type' => 'integer', 'description' => 'Max pages to return (default '
+                                 . BHL_TEXT_PAGES . ', max ' . BHL_MAX_TEXT_PAGES . ').'],
+            ],
+            'required' => ['id'],
+        ],
+        'handler' => function ($args) {
+            $iri = bhlIri(requireArg($args, 'id'));
+            if (!preg_match('#/(part|item|page)/(\d+)$#', $iri, $m)) {
+                throw new BhlError("get_text takes an article, item or page, such as 'part/248', "
+                    . "'item/21356' or 'page/2839616'.");
+            }
+            $kind = $m[1];
+            $id = (int)$m[2];
+            $max = isset($args['max_pages']) ? (int)$args['max_pages'] : BHL_TEXT_PAGES;
+            $max = max(1, min(BHL_MAX_TEXT_PAGES, $max));
+            $s = sparqlIri($iri);
+
+            // Each entry: [pageId, label, url of the OCR, text or null].
+            $pages = [];
+            $total = null;
+            $more = '';
+
+            if ($kind === 'part' && ($keys = listPartOcr($id))) {
+                // Articles published on their own have OCR filed under the article,
+                // and are often missing from the graph, so ask S3 first.
+                $total = count($keys);
+                $keys = array_slice($keys, 0, $max, true);
+                $urls = [];
+                foreach ($keys as $pageId => $key) {
+                    $urls[$pageId] = BHL_S3_BASE . $key;
+                }
+                $got = httpGetMany($urls);
+                $n = 0;
+                foreach ($urls as $pageId => $url) {
+                    $n++;
+                    $body = $got[$pageId]['code'] === 200 ? cleanOcr($got[$pageId]['body']) : null;
+                    $pages[] = [$pageId, "page $n of the article", $url, $body];
+                }
+            } else {
+                if ($kind === 'page') {
+                    $recs = pageRecords("  VALUES ?page { $s }\n", 1);
+                } elseif ($kind === 'part') {
+                    $recs = pageRecords("  ?pp bhlv:part $s ; bhlv:page ?page ; bhlv:sequenceOrder ?pos .\n",
+                        BHL_MAX_LIMIT);
+                    if (!$recs) {
+                        $recs = pageRecords("  $s bhlv:hasPage ?page .\n", BHL_MAX_LIMIT);
+                    }
+                } else {
+                    $from = isset($args['from']) ? max(1, (int)$args['from']) : 1;
+                    $to = isset($args['to']) ? (int)$args['to'] : $from + $max - 1;
+                    $recs = pageRecords("  ?page dcterms:isPartOf $s ; bhlv:sequenceOrder ?seq .\n"
+                        . "  FILTER(?seq >= $from && ?seq <= $to)\n", BHL_MAX_LIMIT);
+                }
+                if (!$recs) {
+                    throw new BhlError("Found no pages for <$iri>. Check the id with get_record.");
+                }
+                $total = count($recs);
+                $recs = array_slice($recs, 0, $max);
+                $texts = fetchPageTexts($recs, $kind === 'part' ? [$id] : []);
+                foreach ($recs as $rec) {
+                    $t = $texts[$rec['page']];
+                    $pages[] = [$rec['page'], pageLabel($rec) . ', seq ' . $rec['seq'], $t['url'], $t['text']];
+                }
+            }
+
+            if ($total > count($pages)) {
+                $more = "\nShowing " . count($pages) . " of $total pages. ";
+                if ($kind === 'item') {
+                    $last = end($recs);
+                    $more .= 'Call again with from=' . ($last['seq'] + 1) . " for the rest.\n";
+                } else {
+                    $more .= "Raise max_pages (up to " . BHL_MAX_TEXT_PAGES . ") for more.\n";
+                }
+            }
+
+            $out = '# OCR text of ' . shortenIri($iri) . ' (' . count($pages) . ' page'
+                 . (count($pages) === 1 ? '' : 's') . ")\n";
+            foreach ($pages as $p) {
+                list($pageId, $label, $url, $text) = $p;
+                $out .= "\n--- bhlpage:$pageId · $label ---\n";
+                $out .= ($text !== null && $text !== '' ? $text : '(no OCR text for this page)') . "\n";
+            }
+            return textResult($out . $more);
+        },
+    ],
+
     'sparql_query' => [
         'title' => 'Run a SPARQL query',
         'description' =>
@@ -1177,6 +1384,245 @@ function assertReadOnly($query)
     }
 }
 
+// ---- PAGE TEXT AND IMAGES ---------------------------------------------
+
+/**
+ * GET several URLs in parallel. Returns [key => ['code' => int, 'body' => string]],
+ * keyed as $urls is; code 0 means the request never completed.
+ */
+function httpGetMany($urls, $timeout = 20)
+{
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($urls as $key => $url) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_USERAGENT      => BHL_SERVER_NAME . '/' . BHL_SERVER_VERSION,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$key] = $ch;
+    }
+    do {
+        $status = curl_multi_exec($mh, $running);
+        if ($running) {
+            curl_multi_select($mh, 1.0);
+        }
+    } while ($running && $status === CURLM_OK);
+
+    $out = [];
+    foreach ($handles as $key => $ch) {
+        $out[$key] = [
+            'code' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+            'body' => (string)curl_multi_getcontent($ch),
+        ];
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+/**
+ * What it takes to find pages on AWS: item id, scan barcode and sequence
+ * number, plus the printed page number for labels. $where must bind ?page,
+ * and may bind ?pos to order the pages (an article's own page order).
+ * Returns one record per page, in order.
+ */
+function pageRecords($where, $limit)
+{
+    $q = prefixBlock()
+       . "SELECT ?page ?item ?seq ?barcode ?num ?prefix WHERE {\n"
+       . $where
+       . "  ?page dcterms:isPartOf ?item .\n"
+       . "  OPTIONAL { ?page bhlv:sequenceOrder ?seq }\n"
+       . "  OPTIONAL { ?page bhlv:pageNumber ?num }\n"
+       . "  OPTIONAL { ?page bhlv:pagePrefix ?prefix }\n"
+       . "  OPTIONAL { ?item dcterms:identifier ?barcode }\n"
+       . "}\nORDER BY ?pos ?seq\nLIMIT " . (int)$limit;
+    $res = sparqlSelect($q);
+
+    $recs = [];
+    foreach ($res['rows'] as $row) {
+        if (!preg_match('#/(\d+)$#', $row['page']['value'], $p)
+            || !preg_match('#/(\d+)$#', $row['item']['value'], $i)) {
+            continue;
+        }
+        // Repeated values multiply rows; the first is as good as any.
+        if (isset($recs[$p[1]])) {
+            continue;
+        }
+        $recs[$p[1]] = [
+            'page'    => (int)$p[1],
+            'item'    => (int)$i[1],
+            'seq'     => isset($row['seq']) ? (int)$row['seq']['value'] : null,
+            'barcode' => isset($row['barcode']) ? $row['barcode']['value'] : null,
+            'num'     => isset($row['num']) ? $row['num']['value'] : null,
+            'prefix'  => isset($row['prefix']) ? $row['prefix']['value'] : null,
+        ];
+    }
+    return array_values($recs);
+}
+
+/** The work a page belongs to, and any articles it is part of. */
+function pageContext($rec)
+{
+    $item = sparqlIri(BHL_BASE . 'item/' . $rec['item']);
+    $page = sparqlIri(BHL_BASE . 'page/' . $rec['page']);
+    $res = sparqlSelect(prefixBlock()
+        . "SELECT ?label ?year ?part ?partTitle WHERE {\n"
+        . "  OPTIONAL { $item dcterms:isPartOf ?t . ?t dcterms:title ?label }\n"
+        . "  OPTIONAL { $item dcterms:date ?year }\n"
+        . "  OPTIONAL { ?part bhlv:hasPage $page . OPTIONAL { ?part dcterms:title ?partTitle } }\n"
+        . "}\nLIMIT 50");
+
+    $ctx = ['title' => null, 'year' => null, 'parts' => []];
+    foreach ($res['rows'] as $row) {
+        if ($ctx['title'] === null && isset($row['label'])) $ctx['title'] = $row['label']['value'];
+        if ($ctx['year'] === null && isset($row['year']))   $ctx['year']  = $row['year']['value'];
+        if (isset($row['part']) && preg_match('#/(\d+)$#', $row['part']['value'], $m)) {
+            $ctx['parts'][(int)$m[1]] = isset($row['partTitle']) ? $row['partTitle']['value'] : null;
+        }
+    }
+    return $ctx;
+}
+
+/** "Page 333", "Plate IV", or "Unnumbered page". */
+function pageLabel($rec)
+{
+    if ($rec['num'] === null || $rec['num'] === '') {
+        return 'Unnumbered page';
+    }
+    return trim(($rec['prefix'] !== null ? $rec['prefix'] : 'Page') . ' ' . $rec['num']);
+}
+
+/** S3 key of a page's OCR, filed under its item. */
+function ocrKey($rec)
+{
+    if ($rec['seq'] === null) {
+        return null;
+    }
+    return sprintf('ocr/item-%06d/item-%06d-%08d-%04d.txt', $rec['item'], $rec['item'], $rec['page'], $rec['seq']);
+}
+
+/** URL of a page's WebP image on AWS, at one of BHL_IMAGE_SIZES. */
+function imageUrl($rec, $size)
+{
+    if ($rec['seq'] === null || $rec['barcode'] === null || $rec['barcode'] === '') {
+        return null;
+    }
+    $b = rawurlencode($rec['barcode']);
+    return BHL_S3_BASE . sprintf('web/%s/%s_%04d_%s.webp', $b, $b, $rec['seq'], $size);
+}
+
+/**
+ * OCR files S3 holds under an article rather than its item, as
+ * [pageId => key] in page order. Only articles published on their own have
+ * these, and their page ids are not zero-padded, so list rather than guess.
+ */
+function listPartOcr($partId)
+{
+    $prefix = sprintf('ocr/part-%06d/', $partId);
+    $r = httpGetMany([BHL_S3_BASE . '?list-type=2&max-keys=1000&prefix=' . rawurlencode($prefix)]);
+    if ($r[0]['code'] !== 200) {
+        return [];
+    }
+    preg_match_all('#<Key>([^<]+)</Key>#', $r[0]['body'], $m);
+    $keys = [];
+    foreach ($m[1] as $key) {
+        if (preg_match('#-(\d+)-(\d{4})\.txt$#', $key, $k)) {
+            $keys[(int)$k[2]] = [(int)$k[1], $key];
+        }
+    }
+    ksort($keys);
+    $out = [];
+    foreach ($keys as $pair) {
+        $out[$pair[0]] = $pair[1];
+    }
+    return $out;
+}
+
+/**
+ * Fetch OCR for page records, in parallel. A page missing from its item's
+ * OCR is looked for under the articles in $partIds.
+ * Returns [pageId => ['text' => string|null, 'url' => string|null]].
+ */
+function fetchPageTexts($recs, $partIds = [])
+{
+    $urls = [];
+    foreach ($recs as $rec) {
+        if (($key = ocrKey($rec)) !== null) {
+            $urls[$rec['page']] = BHL_S3_BASE . $key;
+        }
+    }
+    $got = $urls ? httpGetMany($urls) : [];
+
+    $out = [];
+    $missing = [];
+    foreach ($recs as $rec) {
+        $id = $rec['page'];
+        if (isset($got[$id]) && $got[$id]['code'] === 200) {
+            $out[$id] = ['text' => cleanOcr($got[$id]['body']), 'url' => $urls[$id]];
+        } else {
+            $out[$id] = ['text' => null, 'url' => null];
+            $missing[$id] = true;
+        }
+    }
+
+    foreach ($partIds as $partId) {
+        if (!$missing) break;
+        $keys = array_intersect_key(listPartOcr($partId), $missing);
+        if (!$keys) continue;
+        $urls = [];
+        foreach ($keys as $id => $key) {
+            $urls[$id] = BHL_S3_BASE . $key;
+        }
+        foreach (httpGetMany($urls) as $id => $r) {
+            if ($r['code'] === 200) {
+                $out[$id] = ['text' => cleanOcr($r['body']), 'url' => $urls[$id]];
+                unset($missing[$id]);
+            }
+        }
+    }
+    return $out;
+}
+
+/**
+ * BHL's OCR files use CRLF and usually separate every printed line with a run
+ * of blank lines, which wastes tokens and hides the real paragraph breaks.
+ * Scale each run of newlines down by the shortest one in the file.
+ */
+function cleanOcr($text)
+{
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
+    $text = preg_replace('/[ \t]+\n/', "\n", $text);
+    $text = trim($text);
+    if (!preg_match_all('/\n+/', $text, $m)) {
+        return $text;
+    }
+    $unit = min(array_map('strlen', $m[0]));
+    return preg_replace_callback('/\n+/', function ($r) use ($unit) {
+        return strlen($r[0]) > $unit ? "\n\n" : "\n";
+    }, $text);
+}
+
+/** A page image from AWS as WebP bytes, at one of BHL_IMAGE_SIZES. */
+function pageImage($rec, $size)
+{
+    $url = imageUrl($rec, $size);
+    if ($url === null) {
+        throw new BhlError('the graph does not give this page\'s scan barcode or sequence number, '
+            . 'so its image cannot be located.');
+    }
+    $r = httpGetMany([$url], 30)[0];
+    if ($r['code'] !== 200) {
+        throw new BhlError('the page image is not in BHL\'s open data on AWS (HTTP ' . $r['code'] . ').');
+    }
+    return $r['body'];
+}
+
 // ---- RESOURCES ---------------------------------------------------------
 
 function resourceRegistry()
@@ -1256,7 +1702,12 @@ function handleRpc($req)
                   . "common value is \"Not provided. Contact Holding Institution to verify copyright "
                   . "status.\") only means the rights metadata was not recorded, not that access is "
                   . "restricted. The status and any licence matter only if the user asks about "
-                  . "republishing or commercial reuse; in that case report what the item says.",
+                  . "republishing or commercial reuse; in that case report what the item says.\n\n"
+                  . "To read or show what a page says, use get_text (the OCR of an article, a run of "
+                  . "pages, or one page) and get_page (one page's image and text, plus an image URL you "
+                  . "can show the user). Both read BHL's open data on AWS. Don't fetch "
+                  . "biodiversitylibrary.org page, pageimage or pagetext URLs yourself: BHL sits "
+                  . "behind Cloudflare, which often blocks automated requests.",
             ]);
 
         case 'ping':
@@ -1662,6 +2113,14 @@ function runSmokeTest()
             'arguments' => ['name' => 'Anableps anableps', 'with_title' => true, 'limit' => 3]]]],
         ['resolve_identifier', ['method' => 'tools/call', 'params' => ['name' => 'resolve_identifier',
             'arguments' => ['identifier' => 'Q157501']]]],
+        ['get_page',           ['method' => 'tools/call', 'params' => ['name' => 'get_page',
+            'arguments' => ['page' => 'page/2839616']]]],
+        ['get_text (article)', ['method' => 'tools/call', 'params' => ['name' => 'get_text',
+            'arguments' => ['id' => 'part/248', 'max_pages' => 2]]]],
+        ['get_text (own item)', ['method' => 'tools/call', 'params' => ['name' => 'get_text',
+            'arguments' => ['id' => 'part/98691', 'max_pages' => 2]]]],
+        ['get_text (item)',    ['method' => 'tools/call', 'params' => ['name' => 'get_text',
+            'arguments' => ['id' => 'item/21356', 'from' => 127, 'to' => 128]]]],
         ['sparql_query',       ['method' => 'tools/call', 'params' => ['name' => 'sparql_query',
             'arguments' => ['query' => 'SELECT (COUNT(*) AS ?n) WHERE { ?s a bhlv:Title }']]]],
         ['read-only guard',    ['method' => 'tools/call', 'params' => ['name' => 'sparql_query',
@@ -1683,6 +2142,12 @@ function runSmokeTest()
         $isError = isset($res['error']) || !empty($res['result']['isError']);
         $ok = $expectError ? $isError : !$isError;
         if (!$ok) $failed++;
+
+        // Say whether get_page came back with its image, since that depends on the host.
+        if ($label === 'get_page' && $ok) {
+            $types = array_column(isset($res['result']['content']) ? $res['result']['content'] : [], 'type');
+            $label .= in_array('image', $types, true) ? ' +image' : ' (no image)';
+        }
 
         printf("%-4s %-20s %6d ms\n", $ok ? 'ok' : 'FAIL', $label, $ms);
         if ($verbose || !$ok) {

@@ -121,10 +121,33 @@ Both transports share the same dispatcher, so the tools behave identically.
 | `articles_in_item` | Articles segmented out of one scanned volume |
 | `pages_for_name` | Pages where BHL's name-finder tagged a scientific name |
 | `resolve_identifier` | Wikidata / VIAF / OCLC / LCCN / DOI → the BHL record |
+| `get_page` | One page's image (returned to the model) and OCR text, plus image URLs to show |
+| `get_text` | OCR text of an article, a run of pages in an item, or one page |
 | `sparql_query` | Any read-only SPARQL, with the standard prefixes prepended |
 
-Every tool echoes the SPARQL it ran, which is the point in a workshop: attendees
+Every SPARQL-backed tool echoes the query it ran, which is the point in a workshop: attendees
 see a working query for each question they ask, and can edit it with `sparql_query`.
+
+## Page text and images
+
+`get_page` and `get_text` read BHL's open data on AWS
+(<https://bhl-open-data.s3.amazonaws.com/>), not biodiversitylibrary.org, which sits
+behind Cloudflare and often turns away automated requests. The graph supplies what
+the AWS paths need: each item's scan barcode and each page's sequence number.
+
+Page images come from the bucket's `web/` folder, which the bucket's own README
+does not mention. Alongside the JPEG 2000 masters in `images/`, every page is there
+as WebP at five sizes:
+
+```
+web/{barcode}/{barcode}_{seq:0000}_{size}.webp
+
+thumb   ~235px    small   ~370px    medium  ~730px
+large   ~1460px   full    the original scan
+```
+
+`get_page` returns the image itself, `large` by default, so the model can see the
+page, along with the URL so a client can show it to the user.
 
 ## Resources
 
@@ -161,12 +184,13 @@ curl -sS http://localhost:8000 \
 
 ## Configuration
 
-Both optional, via environment:
+All optional, via environment:
 
 - `BHL_SPARQL_ENDPOINT` — defaults to the koetai BHL endpoint
 - `BHL_HTTP_TIMEOUT` — seconds to wait on the endpoint. Unset, it derives a safe
   value from `max_execution_time`: `min(35, limit - 5)`, or 35 where there is no
   limit (the CLI default). See the Apache notes above for why.
+- `BHL_S3_BASE` — the BHL open data bucket, for page text and images
 
 ## Notes on the endpoint
 
